@@ -1,0 +1,99 @@
+from ultralytics import YOLO
+import cv2
+import time
+from pymodbus.client import ModbusSerialClient as ModbusClient
+
+# --- RS485 / MODBUS ASCII 7-BIT GÜNCEL AYARLARI ---
+client = ModbusClient(
+    port='COM8',                 # Çeviricinin bilgisayardaki güncel COM portu
+    baudrate=9600,               # PLC ile aynı olmalı
+    bytesize=7,                  # ASCII haberleşme için 7 bit
+    parity='E',                  # Even (Çift) parite
+    stopbits=1,                  # 1 stop biti
+    timeout=0.05,                # Python hattan çok hızlı çıkıp kapıyı HMI'a bırakacak
+    retries=3,                   # Paket kaçarsa 3 kez dener
+    framer='ascii'               # Delta PLC varsayılan ASCII modu
+)
+
+client.default_slave = 1
+
+def plc_hata_sinyali_gonder(state):
+    try:
+        if not client.connected:
+            client.connect()
+        
+        # M105 adresinin Modbus ASCII karşılığı: 2153
+        result = client.write_coil(2153, state)
+        if result.isError():
+            pass
+    except Exception:
+        pass
+    finally:
+        client.close()
+
+# --- YOLO MODEL YÜKLEME ---
+model = YOLO(r"C:\Users\ulker\Desktop\yolo\yolo\best.pt")
+
+# Kamera Ayarları
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+# --- REVİZYON ZAMANLAYICI DEĞİŞKENLERİ ---
+last_error_time = 0          # En son ne zaman hata sinyali gönderildiğini tutar
+lock_duration = 5.0          # Hata sonrası sistemin kilitli kalacağı süre (5 Saniye)
+system_locked = False        # Sistem şu an kilitli mi kontrolü
+
+print("Sistem Başlatıldı. 5 Saniye Zaman Kilitli ASCII Modu Aktif...")
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    # Görüntü İşleme
+    results = model(frame, device=0, imgsz=640, conf=0.25, half=True, verbose=False)
+    
+    hata_var_mi = False
+    for r in results:
+        # Parçada kaç tane hata kutusu (box) olursa olsun, > 0 kontrolü ile 
+        # hepsini tek bir "Hata Var" durumuna indirgiyoruz.
+        if len(r.boxes) > 0:
+            hata_var_mi = True
+            break
+
+    current_time = time.time()
+    
+    # --- Yeni Zaman Kilidi Mantığı ---
+    # Eğer sistem kilitliyse ve 5 saniyelik süre dolduysa kilidi aç
+    if system_locked and (current_time - last_error_time > lock_duration):
+        print("5 saniyelik kilit süresi doldu. Sistem yeni parçalar için hazır, PLC sıfırlanıyor...")
+        plc_hata_sinyali_gonder(False)  # PLC'deki M105'i güvenliğe çek
+        system_locked = False
+
+    # Sistem kilitli DEĞİLSE ve ekranda hata (veya hatalar) varsa
+    if hata_var_mi and not system_locked:
+        print("Hata (Defo) Tespit Edildi! PLC'ye (M105) 1 KEZ sinyal gönderiliyor ve sistem 5 saniye kilitleniyor...")
+        plc_hata_sinyali_gonder(True)   # PLC'ye sadece 1 adet bit gönderdik
+        last_error_time = current_time  # Zamanı kaydet
+        system_locked = True            # Sistemi kilitle (5 saniye boyunca bu bloğa girmeyecek)
+
+    # Ekranda Çizim ve Görselleştirme
+    annotated = results[0].plot()
+    
+    # Ekrana sistemin kilitli olup olmadığını yazalım (Sahada izlemesi kolay olsun)
+    if system_locked:
+        kalan_sure = max(0.0, lock_duration - (current_time - last_error_time))
+        cv2.putText(annotated, f"SISTEM KILITLI: {kalan_sure:.1f}s", (20, 40), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+    else:
+        cv2.putText(annotated, "SISTEM HAZIR (IZLIYOR)", (20, 40), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+    cv2.imshow("YOLO Kalite Kontrol - KOCAKER", annotated)
+
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
